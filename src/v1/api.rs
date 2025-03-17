@@ -7,7 +7,9 @@ use crate::v1::audio::{
     AudioTranslationRequest, AudioTranslationResponse,
 };
 use crate::v1::batch::{BatchResponse, CreateBatchRequest, ListBatchResponse};
-use crate::v1::chat_completion::{ChatCompletionRequest, ChatCompletionResponse};
+use crate::v1::chat_completion::{
+    ChatCompletionRequest, ChatCompletionResponse, ChatCompletionResponseForStream,
+};
 use crate::v1::common;
 use crate::v1::completion::{CompletionRequest, CompletionResponse};
 use crate::v1::edit::{EditRequest, EditResponse};
@@ -36,13 +38,14 @@ use crate::v1::run::{
     RunStepObject,
 };
 use crate::v1::thread::{CreateThreadRequest, ModifyThreadRequest, ThreadObject};
-
 use bytes::Bytes;
+use futures_util::StreamExt;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use reqwest::multipart::{Form, Part};
 use reqwest::{Client, Method, Response};
 use serde::Serialize;
 use serde_json::Value;
+use tokio_stream::Stream;
 
 use std::error::Error;
 use std::fs::{create_dir_all, File};
@@ -239,6 +242,7 @@ impl OpenAIClient {
                 }),
             }
         } else {
+            let status = response.status();
             let error_message = response
                 .text()
                 .await
@@ -323,6 +327,99 @@ impl OpenAIClient {
         req: ChatCompletionRequest,
     ) -> Result<ChatCompletionResponse, APIError> {
         self.post("chat/completions", &req).await
+    }
+
+    pub async fn chat_completion_stream(
+        &mut self,
+        req: ChatCompletionRequest,
+    ) -> Result<impl Stream<Item = Result<ChatCompletionResponseForStream, APIError>>, APIError>
+    {
+        // Ensure stream is set to true
+        // let req = ChatCompletionRequest {
+        //     stream: Some(true),
+        //     ..req.clone()
+        // };
+        // let request = self
+        //     .build_request(Method::POST, "chat/completions")
+        //     .await
+        //     .json(&req);
+
+        // let response = request.send().await.map_err(|e| APIError::CustomError {
+        //     message: e.to_string(),
+        // })?;
+        // let bytes = response.bytes().await.unwrap();
+        // let text = String::from_utf8_lossy(&bytes);
+        // dbg!(text.split("content\":\"").collect::<Vec<_>>());
+
+        let req = ChatCompletionRequest {
+            stream: Some(true),
+            ..req.clone()
+        };
+
+        let request = self
+            .build_request(Method::POST, "chat/completions")
+            .await
+            .json(&req);
+
+        let response = request.send().await.map_err(|e| APIError::CustomError {
+            message: e.to_string(),
+        })?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let error_message = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
+            return Err(APIError::CustomError {
+                message: format!("{}: {}", status, error_message),
+            });
+        }
+
+        let stream =
+            ResponseStream::new(response.bytes_stream().map(|result| {
+                result.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+            }));
+        // let stream = response.bytes_stream().map(|result| match result {
+        //     Ok(bytes) => {
+        //         let text = String::from_utf8_lossy(&bytes);
+        //         // dbg!(&text);
+        //         dbg!(text.clone().split("content\":\"").collect::<Vec<_>>());
+        //         let test = text.split("data: ").collect::<Vec<&str>>();
+
+        //         for t in test {
+        //             if t == "[DONE]" {
+        //                 return Ok(ChatCompletionResponseForStream {
+        //                     id: None,
+        //                     object: "chat.completion.chunk".to_string(),
+        //                     created: 0,
+        //                     model: "".to_string(),
+        //                     choices: vec![],
+        //                     system_fingerprint: None,
+        //                 });
+        //             }
+
+        //             let result = serde_json::from_str::<ChatCompletionResponseForStream>(t)
+        //                 .map_err(|e| APIError::CustomError {
+        //                     message: format!("Failed to parse JSON: {}", e),
+        //                 });
+
+        //             if let Ok(result) = result {
+        //                 return Ok(result);
+        //             }
+        //         }
+
+        //         // Add default return for the case when no valid responses found
+        //         Err(APIError::CustomError {
+        //             message: "No valid response found in stream".to_string(),
+        //         })
+        //     }
+        //     Err(e) => Err(APIError::CustomError {
+        //         message: format!("Stream error: {}", e),
+        //     }),
+        // });
+
+        Ok(stream)
     }
 
     pub async fn audio_transcription(
@@ -900,5 +997,129 @@ impl OpenAIClient {
         }
 
         Ok(form)
+    }
+}
+
+use std::pin::Pin;
+use std::task::{Context, Poll};
+
+struct SSEStreamParser {
+    buffer: String,
+}
+
+impl SSEStreamParser {
+    fn new() -> Self {
+        Self {
+            buffer: String::new(),
+        }
+    }
+
+    fn process_chunk(
+        &mut self,
+        chunk: &str,
+    ) -> Vec<Result<ChatCompletionResponseForStream, APIError>> {
+        self.buffer.push_str(chunk);
+
+        let mut results = Vec::new();
+        let mut remaining = String::new();
+
+        for line in self.buffer.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+
+            if line == "data: [DONE]" {
+                results.push(Ok(ChatCompletionResponseForStream {
+                    id: None,
+                    object: "chat.completion.chunk".to_string(),
+                    created: 0,
+                    model: "".to_string(),
+                    choices: vec![],
+                    system_fingerprint: None,
+                }));
+                continue;
+            }
+
+            if line.starts_with("data: ") {
+                let json_str = &line["data: ".len()..];
+                match serde_json::from_str::<ChatCompletionResponseForStream>(json_str) {
+                    Ok(response) => results.push(Ok(response)),
+                    Err(e) => {
+                        // This could be a partial message, so we add it to remaining
+                        remaining.push_str(line);
+                        remaining.push('\n');
+                    }
+                }
+            } else {
+                // Not a data line, could be partial, keep it
+                remaining.push_str(line);
+                remaining.push('\n');
+            }
+        }
+
+        // Update buffer with remaining partial data
+        self.buffer = remaining;
+
+        results
+    }
+}
+
+// Stream transformer that converts bytes to parsed responses
+pub struct ResponseStream<S> {
+    inner: S,
+    parser: SSEStreamParser,
+    pending_items: Vec<Result<ChatCompletionResponseForStream, APIError>>,
+}
+
+impl<S> ResponseStream<S> {
+    pub fn new(stream: S) -> Self {
+        Self {
+            inner: stream,
+            parser: SSEStreamParser::new(),
+            pending_items: Vec::new(),
+        }
+    }
+}
+
+impl<S> Stream for ResponseStream<S>
+where
+    S: Stream<Item = Result<bytes::Bytes, std::io::Error>> + Unpin,
+{
+    type Item = Result<ChatCompletionResponseForStream, APIError>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        // If we have pending items from previous processing, return them first
+        if !self.pending_items.is_empty() {
+            return Poll::Ready(Some(self.pending_items.remove(0)));
+        }
+
+        // Otherwise poll the inner stream for more data
+        match Pin::new(&mut self.inner).poll_next(cx) {
+            Poll::Ready(Some(Ok(bytes))) => {
+                let text = String::from_utf8_lossy(&bytes);
+                let results = self.parser.process_chunk(&text);
+
+                if results.is_empty() {
+                    // No complete messages yet, just register for future wakeup
+                    cx.waker().wake_by_ref();
+                    return Poll::Pending;
+                }
+
+                let mut results = results.into_iter();
+                let next = results.next();
+
+                // Store all but the first result for future polls
+                if results.len() > 0 {
+                    self.pending_items.extend(results);
+                }
+
+                Poll::Ready(next)
+            }
+            Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(APIError::CustomError {
+                message: format!("Stream error: {}", e),
+            }))),
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
+        }
     }
 }

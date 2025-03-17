@@ -236,9 +236,22 @@ pub struct ChatCompletionMessageForResponse {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
+pub struct ChatCompletionMessageForStream {
+    pub content: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
 pub struct ChatCompletionChoice {
     pub index: i64,
     pub message: ChatCompletionMessageForResponse,
+    pub finish_reason: Option<FinishReason>,
+    pub finish_details: Option<FinishDetails>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct ChatCompletionChoiceForStream {
+    pub index: i64,
+    pub delta: ChatCompletionMessageForStream,
     pub finish_reason: Option<FinishReason>,
     pub finish_details: Option<FinishDetails>,
 }
@@ -251,6 +264,16 @@ pub struct ChatCompletionResponse {
     pub model: String,
     pub choices: Vec<ChatCompletionChoice>,
     pub usage: common::Usage,
+    pub system_fingerprint: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct ChatCompletionResponseForStream {
+    pub id: Option<String>,
+    pub object: String,
+    pub created: i64,
+    pub model: String,
+    pub choices: Vec<ChatCompletionChoiceForStream>,
     pub system_fingerprint: Option<String>,
 }
 
